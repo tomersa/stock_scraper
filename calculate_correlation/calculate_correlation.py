@@ -1,163 +1,149 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[5]:
-
+import logging
+import os
 
 import pandas as pd
-import numpy as np
-
 import datetime as dt
-import matplotlib.pyplot as pyplt
-from datetime import timedelta
+import itertools
+import glob
+import argparse
+import time
 
-get_ipython().run_line_magic('matplotlib', 'inline')
+OUTPUT_CSV_PATH = os.path.join('output', f'output.csv')
 
-first_stock = 's_n_p_500_historical_data.csv'
-second_stock = 'nasdaq_historical_data.csv'
 SAMPLING_RATE = 'M'
+CSV_DIRECTORY = '/home/tomer/workspace/workspace/financial_data/output/run_1590234732'
 
+SAMPLING_RATE_NAMING = {'M': 'Monthly'}
 
-# In[6]:
+COPY_TO_OUTPUT_THRESHOLD = 5
 
+parser = argparse.ArgumentParser(description='Calculate correlation between stocks.')
+parser.add_argument('--csv_dir',
+                    metavar='d',
+                    type=str,
+                    default=CSV_DIRECTORY,
+                    help='Directory where all the csv historical data is located')
+parser.add_argument('--sampling_rate',
+                    metavar='s',
+                    type=str,
+                    default=SAMPLING_RATE,
+                    help='Sampling rate')
 
-df_SAIL = pd.read_csv(first_stock)
-df_JSW = pd.read_csv(second_stock)
+args = parser.parse_args()
+CSV_DIRECTORY = args.csv_dir if args.csv_dir else CSV_DIRECTORY
+SAMPLING_RATE = args.sampling_rate if args.sampling_rate else SAMPLING_RATE
 
-df_SAIL.head()
-#print(df_SAIL[['Date', 'Open', 'High', 'Low', 'Close']][:3])
-#print(df_JSW[['Date', 'Open', 'High', 'Low', 'Close']][:3])
+try:
+    os.mkdir('output')
+except Exception:
+    pass
 
+logging.basicConfig(filename="output/log.log",
+                    filemode='a',
+                    format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
+                    datefmt='%H:%M:%S',
+                    level=logging.DEBUG)
 
-# In[7]:
+logging.getLogger().addHandler(logging.StreamHandler())
 
 
-df_JSW.info()
+def calculate_correlation(first_stock, second_stock):
+    first_stock_df = pd.read_csv(first_stock)
+    second_stock_df = pd.read_csv(second_stock)
 
+    first_stock_df['dailyret'] = first_stock_df['Close'].pct_change(1)
+    second_stock_df['dailyret'] = second_stock_df['Close'].pct_change(1)
 
-# In[8]:
+    second_stock_df.set_index(second_stock_df['Date'].apply(lambda x: dt.datetime.strptime(x,'%Y-%m-%d')), drop=True, inplace=True)
+    first_stock_df.set_index(first_stock_df['Date'].apply(lambda x: dt.datetime.strptime(x,'%Y-%m-%d')), drop=True, inplace=True)
 
+    first_stock_df = first_stock_df.resample(SAMPLING_RATE).mean()
+    second_stock_df = second_stock_df.resample(SAMPLING_RATE).mean()
 
-#Add a new column for daily return on closing price to each dataframe
-df_SAIL['dailyret'] = df_SAIL['Close'].pct_change(1)
-df_JSW['dailyret'] = df_JSW['Close'].pct_change(1)
+    first_stock_df['dailyret'] = first_stock_df['Close'].pct_change(1)
+    second_stock_df['dailyret'] = second_stock_df['Close'].pct_change(1)
 
-#plot
-df_SAIL['dailyret'].plot()
-df_JSW['dailyret'].plot()
+    first_daily_ret_mean = first_stock_df['dailyret'].mean()
+    second_stock_dailyret_mean = second_stock_df['dailyret'].mean()
 
+    second_stock_df['dailyret deviation'] = second_stock_df['dailyret'].apply(lambda x: x - second_stock_dailyret_mean)
+    first_stock_df['dailyret deviation'] = first_stock_df['dailyret'].apply(lambda x: x - first_daily_ret_mean)
 
-# In[9]:
+    min_date = max(second_stock_df.index[0], first_stock_df.index[0])
+    max_date = min(second_stock_df.index[-1], first_stock_df.index[-1])
 
+    first_stock_df = first_stock_df[min_date <= first_stock_df.index]
+    first_stock_df = first_stock_df[first_stock_df.index <= max_date]
 
-#Index the dataframes
-df_JSW.set_index(df_JSW['Date'].apply(lambda x: dt.datetime.strptime(x,'%Y-%m-%d')), drop=True, inplace=True)
+    second_stock_df = second_stock_df[min_date <= second_stock_df.index]
+    second_stock_df = second_stock_df[second_stock_df.index <= max_date]
 
-df_SAIL.set_index(df_SAIL['Date'].apply(lambda x: dt.datetime.strptime(x,'%Y-%m-%d')), drop=True, inplace=True)
+    deviation = first_stock_df['dailyret deviation'][1:]  * second_stock_df['dailyret deviation'][1:]
+    covariance = sum(deviation) / (len(first_stock_df) - 1)
+    #print("Covariance of Daily Return : ",  covariance)
 
+    sigma_second = second_stock_df['dailyret'].std()
+    sigma_first = first_stock_df['dailyret'].std()
+    coeff_cor = covariance / (sigma_second * sigma_first)
+    return coeff_cor
 
-# In[ ]:
 
+def main():
+    listing = glob.glob(os.path.join(CSV_DIRECTORY, '*.csv'))
+    stock_pairs = set([i for i in itertools.combinations(listing, 2)])
 
-df_SAIL = df_SAIL.resample(SAMPLING_RATE).mean()
-df_JSW = df_JSW.resample(SAMPLING_RATE).mean()
+    output_path = None
+    if os.path.exists(OUTPUT_CSV_PATH):
+        output_path = OUTPUT_CSV_PATH
+    elif os.path.exists(OUTPUT_CSV_PATH + '_1'):
+        output_path = OUTPUT_CSV_PATH + '_1'
 
+    if os.path.exists(output_path):
+        results = pd.read_csv(output_path).to_dict()
+        stock_pairs = set(stock_pairs).difference(set(zip(results['first'].values(), results['second'].values())))
 
-# In[145]:
+        for key in results.keys():
+            results[key] = list(results[key].values())
+    else:
+        results = {'first': [], 'second': [], 'sampling': [], 'correlation': []}
 
+    logging.info(f'Found [{len(stock_pairs)}] pairs to check')
 
-# #Filter by date to view the anomaly
-# start_date = '01-Jan-2017'
-# end_date = '10-Jan-2017'
-# startdate = pd.to_datetime(start_date)
-# enddate = pd.to_datetime(end_date)
-# df_JSW['dailyret'][startdate:enddate].plot()
- 
+    process_counter = 0
 
-
-# #The anomaly lies on the 4th of Jan 2017, as is observed from the data. Let's have a look at the data around this date.
-
-# df_JSW[startdate:enddate][:3]
-
-# #Delete a few columns that are not needed and have a look at the data.
-
-
-# In[146]:
-
-
-df_SAIL.head()
-
-
-# In[147]:
-
-
-#Analyze correlation between stocks of the same sector
-df_JSW['dailyret'] = df_JSW['Close'].pct_change(1)
-
-#3. Multiply the daily return deviation
-#4. Divide by the number of rows to arrive at covariance
-
-#5. Further , Calculate the correlation co-efficient from covariance
-#6. Calculate standard deviation of Daily return of each stock
-
-#1. Calculate mean of daily return
-jsw_dailyret_mean =  df_JSW['dailyret'].mean()
-sail_daily_ret_mean = df_SAIL['dailyret'].mean()
-
-print("JSW Daily Return Average : " , jsw_dailyret_mean * 10000 , " basis points ")
-print("SAIL Daily Return Average : " , sail_daily_ret_mean * 10000 , " basis points ")
-
-#JSW Daily Return Average :  14.6521291185  basis points 
-#SAIL Daily Return Average :  26.5038546269  basis 
-
-
-# In[148]:
-
-
-#2. Calculate deviation from the mean for each row for each dataframe
-df_JSW['dailyret dev'] = df_JSW['dailyret'].apply(lambda x : x - jsw_dailyret_mean )
-df_SAIL['dailyret dev'] = df_SAIL['dailyret'].apply(lambda x : x - sail_daily_ret_mean )
-
-print(df_JSW['dailyret dev'][:3])
-print(df_SAIL['dailyret dev'][:3])
-
-
-# In[149]:
-
-
-min_date = max(df_JSW.index[0], df_SAIL.index[0])
-max_date = min(df_JSW.index[-1], df_SAIL.index[-1])
-display([min_date, max_date])
-
-
-# In[150]:
-
-
-df_SAIL = df_SAIL[min_date <= pd.to_datetime(df_SAIL['Date'])][pd.to_datetime(df_SAIL['Date']) <= max_date]
-df_JSW = df_JSW[min_date <= pd.to_datetime(df_JSW['Date'])][pd.to_datetime(df_JSW['Date']) <= max_date]
-
-
-# In[151]:
-
-
-dev_sail_jsw_steel =  df_SAIL['dailyret dev'][1:]  * df_JSW['dailyret dev'][1:]
-cov_sail_jsw_steel = sum(dev_sail_jsw_steel) / (len(df_SAIL) - 1)
-print("Covariance of Daily Return : ",  cov_sail_jsw_steel)
-
-#Covariance of Daily Return :  0.000281631199282
-
-
-# In[152]:
-
-
-sigma_jsw = df_JSW['dailyret'].std()
-sigma_sail = df_SAIL['dailyret'].std()
-coeff_cor = cov_sail_jsw_steel / (sigma_jsw * sigma_sail)
-print(coeff_cor)
-
-#0.626551516998
-# Interpretation
-#A value of 0.62 indicates a relatively strong correlation between the two equities. This implies that the daily return of the two equities , typically moves in the same direction. 
- 
- 
-
+    for pair in stock_pairs:
+        first_stock, second_stock = pair
+        try:
+            logging.info(f'Calculating correlation for {first_stock} and {second_stock}')
+            correlation = calculate_correlation(first_stock, second_stock)
+
+            results['first'].append(first_stock)
+            results['second'].append(second_stock)
+            results['sampling'].append(SAMPLING_RATE_NAMING[SAMPLING_RATE])
+            results['correlation'].append(correlation)
+
+            process_counter = (process_counter + 1) % COPY_TO_OUTPUT_THRESHOLD
+            if process_counter == 0:
+                logging.info('Writing to output csv')
+                if os.path.exists(OUTPUT_CSV_PATH):
+                    if os.path.exists(OUTPUT_CSV_PATH + '_1'):
+                        os.remove(OUTPUT_CSV_PATH + '_1')
+                    os.rename(OUTPUT_CSV_PATH, OUTPUT_CSV_PATH + '_1')
+
+                pd.DataFrame(results).to_csv(OUTPUT_CSV_PATH, columns=('first', 'second', 'sampling', 'correlation'))
+
+        except Exception as e:
+            logging.error(f'Failed calculating correlation for stocks: {pair}')
+            logging.error(e)
+        finally:
+            logging.info('Writing to output csv')
+            if os.path.exists(OUTPUT_CSV_PATH):
+                if os.path.exists(OUTPUT_CSV_PATH + '_1'):
+                    os.remove(OUTPUT_CSV_PATH + '_1')
+                os.rename(OUTPUT_CSV_PATH, OUTPUT_CSV_PATH + '_1')
+
+            pd.DataFrame(results).to_csv(OUTPUT_CSV_PATH, columns=('first', 'second', 'sampling', 'correlation'))
+
+
+if __name__ == '__main__':
+    main()
